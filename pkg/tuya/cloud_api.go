@@ -209,7 +209,7 @@ func (c *TuyaCloudApiClient) loadWebrtcConfig() (*WebRTCConfig, error) {
 	}
 
 	if !webRTCConfigResponse.Success {
-		return nil, fmt.Errorf(webRTCConfigResponse.Msg)
+		return nil, errors.New(webRTCConfigResponse.Msg)
 	}
 
 	err = json.Unmarshal([]byte(webRTCConfigResponse.Result.Skill), &c.skill)
@@ -255,7 +255,7 @@ func (c *TuyaCloudApiClient) loadHubConfig() (config *MQTTConfig, err error) {
 	}
 
 	if !openIoTHubConfigResponse.Success {
-		return nil, fmt.Errorf(openIoTHubConfigResponse.Msg)
+		return nil, errors.New(openIoTHubConfigResponse.Msg)
 	}
 
 	return &MQTTConfig{
