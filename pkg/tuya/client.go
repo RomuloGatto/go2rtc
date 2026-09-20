@@ -71,6 +71,7 @@ func Dial(rawURL string) (core.Producer, error) {
 	// Stream params
 	streamResolution := query.Get("resolution")
 
+	useLanApi := u.Scheme == "tuya-lan"
 	useSmartApi := deviceId != "" && email != "" && password != ""
 	useCloudApi := deviceId != "" && uid != "" && clientId != "" && clientSecret != ""
 
@@ -78,7 +79,7 @@ func Dial(rawURL string) (core.Producer, error) {
 		streamResolution = "hd"
 	}
 
-	if !useSmartApi && !useCloudApi {
+	if !useLanApi && !useSmartApi && !useCloudApi {
 		return nil, errors.New("tuya: wrong query params")
 	}
 
@@ -86,7 +87,11 @@ func Dial(rawURL string) (core.Producer, error) {
 		handlers: make(map[uint32]func(*rtp.Packet)),
 	}
 
-	if useSmartApi {
+	if useLanApi {
+		if client.api, err = NewTuyaLanApiClient(u); err != nil {
+			return nil, fmt.Errorf("tuya: %w", err)
+		}
+	} else if useSmartApi {
 		if client.api, err = NewTuyaSmartApiClient(nil, u.Hostname(), email, password, deviceId); err != nil {
 			return nil, fmt.Errorf("tuya: %w", err)
 		}
@@ -134,15 +139,20 @@ func Dial(rawURL string) (core.Producer, error) {
 	client.conn.Mode = core.ModeActiveProducer
 	client.conn.Protocol = "mqtt"
 
-	mqttClient := client.api.GetMqtt()
-	if mqttClient == nil {
-		err = errors.New("tuya: no mqtt client")
+	signalClient := client.api.GetSignal()
+	if signalClient == nil {
+		err = errors.New("tuya: no signaling client")
 		client.Close(err)
 		return nil, err
 	}
 
-	// Set up MQTT handlers
-	mqttClient.handleAnswer = func(answer AnswerFrame) {
+	// Set up signaling handlers
+	signalClient.SetHandlers(func(answer AnswerFrame) {
+		if _, isLAN := client.api.(*TuyaLanAPIClient); isLAN {
+			// The LAN answer carries the camera's KCP video section, which Pion can't
+			// negotiate; keep the bidirectional G.711 audio m-line only.
+			answer.Sdp = normalizeTuyaLanAnswer(answer.Sdp)
+		}
 		// fmt.Printf("tuya: answer: %s\n", answer.Sdp)
 
 		desc := pion.SessionDescription{
@@ -184,9 +194,7 @@ func Dial(rawURL string) (core.Producer, error) {
 				}
 			}
 		}
-	}
-
-	mqttClient.handleCandidate = func(candidate CandidateFrame) {
+	}, func(candidate CandidateFrame) {
 		// fmt.Printf("tuya: candidate: %s\n", candidate.Candidate)
 
 		if candidate.Candidate != "" {
@@ -195,17 +203,13 @@ func Dial(rawURL string) (core.Producer, error) {
 				client.Close(err)
 			}
 		}
-	}
-
-	mqttClient.handleDisconnect = func() {
+	}, func() {
 		// fmt.Println("tuya: disconnect")
 		client.Close(errors.New("mqtt: disconnect"))
-	}
-
-	mqttClient.handleError = func(err error) {
+	}, func(err error) {
 		// fmt.Printf("tuya: error: %s\n", err.Error())
 		client.Close(err)
-	}
+	})
 
 	if client.isHEVC {
 		maxRetransmits := uint16(5)
@@ -269,7 +273,7 @@ func Dial(rawURL string) (core.Producer, error) {
 		switch msg := msg.(type) {
 		case *pion.ICECandidate:
 			_ = sendOffer.Wait()
-			if err := mqttClient.SendCandidate("a=" + msg.ToJSON().Candidate); err != nil {
+			if err := signalClient.SendCandidate("a=" + msg.ToJSON().Candidate); err != nil {
 				client.Close(err)
 			}
 
@@ -283,7 +287,7 @@ func Dial(rawURL string) (core.Producer, error) {
 				// On HEVC, wait for DataChannel to be opened and camera to send codec info
 				if !client.isHEVC {
 					if streamResolution == "hd" {
-						_ = mqttClient.SendResolution(0)
+						_ = signalClient.SendResolution(0)
 					}
 					client.connected.Done(nil)
 				}
@@ -314,7 +318,7 @@ func Dial(rawURL string) (core.Producer, error) {
 	offer = re.ReplaceAllString(offer, "")
 
 	// Send offer
-	if err := mqttClient.SendOffer(offer, streamResolution, client.streamType, client.isHEVC); err != nil {
+	if err := signalClient.SendOffer(offer, streamResolution, client.streamType, client.isHEVC); err != nil {
 		err = fmt.Errorf("tuya: %w", err)
 		client.Close(err)
 		return nil, err
@@ -354,54 +358,75 @@ func (c *Client) AddTrack(media *core.Media, codec *core.Codec, track *core.Rece
 	// 	_ = mqttClient.SendSpeaker(1)
 	// }
 
+	// Protocol 312 (speaker): opens the camera's speaker for the backchannel. The
+	// command is acknowledged asynchronously by the camera, so it must not be sent
+	// inline from AddTrack. Only the LAN transport is known to answer it, the cloud
+	// path keeps it disabled.
+	if _, isLAN := c.api.(*TuyaLanAPIClient); isLAN {
+		if signalClient := c.api.GetSignal(); signalClient != nil {
+			go func() { _ = signalClient.SendSpeaker(1) }()
+		}
+	}
+
 	payloadType := codec.PayloadType
 
 	sender := core.NewSender(media, codec)
 
-	switch track.Codec.Name {
-	case core.CodecPCMA, core.CodecPCMU, core.CodecPCM, core.CodecPCML:
-		// Frame size affects audio delay with Tuya cameras:
-		// Browser sends standard 20ms frames (160 bytes for G.711), but this causes
-		// up to 4s delay on some Tuya cameras. Increasing to 240 bytes (30ms) reduces
-		// delay to ~2s. Higher values (320+ bytes) don't work and cause issues.
-		// Using 240 bytes (30ms) as optimal balance between latency and stability.
-		frameSize := 240
-
-		var buf []byte
-		var seq uint16
-		var ts uint32
-
-		sender.Handler = func(packet *rtp.Packet) {
-			buf = append(buf, packet.Payload...)
-
-			for len(buf) >= frameSize {
-				payload := buf[:frameSize]
-
-				pkt := &rtp.Packet{
-					Header: rtp.Header{
-						Version:        2,
-						Marker:         true,
-						PayloadType:    payloadType,
-						SequenceNumber: seq,
-						Timestamp:      ts,
-						SSRC:           packet.SSRC,
-					},
-					Payload: payload,
-				}
-
-				seq++
-				ts += uint32(frameSize)
-				buf = buf[frameSize:]
-
-				c.conn.Send += pkt.MarshalSize()
-				_ = localTrack.WriteRTP(payloadType, pkt)
-			}
-		}
-
-	default:
+	if _, isLAN := c.api.(*TuyaLanAPIClient); isLAN {
+		// The LAN answer negotiates G.711/8000 sendrecv and the camera's LAN stack takes
+		// standard 20ms frames. The 240-byte reframing below only exists to cut the delay
+		// behind the Tuya cloud relay; sending 30ms frames over the LAN makes this camera
+		// drop the audio completely, so forward the browser payload untouched.
 		sender.Handler = func(packet *rtp.Packet) {
 			c.conn.Send += packet.MarshalSize()
 			_ = localTrack.WriteRTP(payloadType, packet)
+		}
+	} else {
+		switch track.Codec.Name {
+		case core.CodecPCMA, core.CodecPCMU, core.CodecPCM, core.CodecPCML:
+			// Frame size affects audio delay with Tuya cameras:
+			// Browser sends standard 20ms frames (160 bytes for G.711), but this causes
+			// up to 4s delay on some Tuya cameras. Increasing to 240 bytes (30ms) reduces
+			// delay to ~2s. Higher values (320+ bytes) don't work and cause issues.
+			// Using 240 bytes (30ms) as optimal balance between latency and stability.
+			frameSize := 240
+
+			var buf []byte
+			var seq uint16
+			var ts uint32
+
+			sender.Handler = func(packet *rtp.Packet) {
+				buf = append(buf, packet.Payload...)
+
+				for len(buf) >= frameSize {
+					payload := buf[:frameSize]
+
+					pkt := &rtp.Packet{
+						Header: rtp.Header{
+							Version:        2,
+							Marker:         true,
+							PayloadType:    payloadType,
+							SequenceNumber: seq,
+							Timestamp:      ts,
+							SSRC:           packet.SSRC,
+						},
+						Payload: payload,
+					}
+
+					seq++
+					ts += uint32(frameSize)
+					buf = buf[frameSize:]
+
+					c.conn.Send += pkt.MarshalSize()
+					_ = localTrack.WriteRTP(payloadType, pkt)
+				}
+			}
+
+		default:
+			sender.Handler = func(packet *rtp.Packet) {
+				c.conn.Send += packet.MarshalSize()
+				_ = localTrack.WriteRTP(payloadType, packet)
+			}
 		}
 	}
 
