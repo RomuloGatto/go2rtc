@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
 )
@@ -244,5 +245,54 @@ func TestTuyaLanAudioCodecs(t *testing.T) {
 		if codec.ClockRate != 8000 || codec.Channels != 1 {
 			t.Fatalf("codec = %v, want 8000/1", codec)
 		}
+	}
+}
+
+func TestLanRetryDelay(t *testing.T) {
+	// Invariants: the first failure waits the minimum, every further failure waits longer,
+	// and the wait is capped so a dead camera cannot stall the stream forever.
+	if got := lanRetryDelay(1); got != lanRetryMin {
+		t.Fatalf("first failure: got %s, want %s", got, lanRetryMin)
+	}
+
+	prev := time.Duration(0)
+	for failures := 1; failures <= 12; failures++ {
+		got := lanRetryDelay(failures)
+		if got < prev {
+			t.Fatalf("delay decreased at failure %d: %s < %s", failures, got, prev)
+		}
+		if got > lanRetryMax {
+			t.Fatalf("delay exceeded cap at failure %d: %s > %s", failures, got, lanRetryMax)
+		}
+		prev = got
+	}
+
+	if got := lanRetryDelay(64); got != lanRetryMax {
+		t.Fatalf("cap: got %s, want %s", got, lanRetryMax)
+	}
+}
+
+func TestLanRetryAllow(t *testing.T) {
+	// Contract: a failed attempt closes the window (no camera traffic until it expires), a
+	// successful session clears the state, and both are observable through Allow/Remaining.
+	lanRetry.OK()
+	if !lanRetry.Allow() {
+		t.Fatal("fresh state must allow a session")
+	}
+	if d := lanRetry.Remaining(); d != 0 {
+		t.Fatalf("fresh state remaining = %s, want 0", d)
+	}
+
+	lanRetry.Failed()
+	if lanRetry.Allow() {
+		t.Fatal("must not allow a session right after a failure")
+	}
+	if d := lanRetry.Remaining(); d <= 0 || d > lanRetryMax {
+		t.Fatalf("remaining = %s, want (0, %s]", d, lanRetryMax)
+	}
+
+	lanRetry.OK()
+	if !lanRetry.Allow() {
+		t.Fatal("a successful session must clear the backoff")
 	}
 }

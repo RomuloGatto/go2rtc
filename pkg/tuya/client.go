@@ -8,12 +8,20 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
 	"github.com/AlexxIT/go2rtc/pkg/webrtc"
 	"github.com/pion/rtp"
 	pion "github.com/pion/webrtc/v4"
 )
+
+// noMediaTimeout is how long a completed WebRTC connection may stay silent before Dial gives
+// up on it. The camera needs a second or two to start sending media on a healthy session.
+const noMediaTimeout = 5 * time.Second
+
+// sessionTimeout bounds the handshake, the offer and the ICE negotiation together.
+const sessionTimeout = 15 * time.Second
 
 type Client struct {
 	api       TuyaAPI
@@ -88,7 +96,12 @@ func Dial(rawURL string) (core.Producer, error) {
 	}
 
 	if useLanApi {
+		if !lanRetry.Allow() {
+			return nil, fmt.Errorf("tuya lan: camera session busy, retry in %s", lanRetry.Remaining())
+		}
+
 		if client.api, err = NewTuyaLanApiClient(u); err != nil {
+			lanRetry.Failed()
 			return nil, fmt.Errorf("tuya: %w", err)
 		}
 	} else if useSmartApi {
@@ -102,6 +115,9 @@ func Dial(rawURL string) (core.Producer, error) {
 	}
 
 	if err := client.api.Init(); err != nil {
+		if useLanApi {
+			lanRetry.Failed()
+		}
 		return nil, fmt.Errorf("tuya: %w", err)
 	}
 
@@ -326,11 +342,47 @@ func Dial(rawURL string) (core.Producer, error) {
 
 	sendOffer.Done(nil)
 
+	// Bound the whole session setup. When the camera has no media session left to hand out it
+	// answers the offer and then simply never starts sending media, and this wait has no
+	// deadline of its own: the producer would stay blocked forever, so the source never
+	// retried and stayed dead until go2rtc was restarted.
+	sessionTimer := time.AfterFunc(sessionTimeout, func() {
+		client.connected.Done(errors.New("tuya: session timeout"))
+	})
+	defer sessionTimer.Stop()
+
 	// Wait for connection
 	if err = client.connected.Wait(); err != nil {
+		if useLanApi {
+			lanRetry.Failed()
+		}
 		err = fmt.Errorf("tuya: %w", err)
 		client.Close(err)
 		return nil, err
+	}
+
+	// The camera answers an offer even when it has no media session left to hand out: the
+	// WebRTC connection completes but no media ever arrives. Report that as a dial error so the
+	// streams module retries with its backoff (1s/5s/10s/60s) instead of re-opening a session
+	// immediately - a hot retry loop keeps the camera's (very small) session table full, which
+	// is what makes the source stay broken until the process is restarted.
+	if !client.isHEVC {
+		deadline := time.Now().Add(noMediaTimeout)
+		for len(client.conn.Receivers) == 0 {
+			if time.Now().After(deadline) {
+				err = errors.New("tuya: no media from camera")
+				if useLanApi {
+					lanRetry.Failed()
+				}
+				client.Close(err)
+				return nil, err
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	if useLanApi {
+		lanRetry.OK()
 	}
 
 	return client, nil
