@@ -29,6 +29,7 @@ type Client struct {
 	pc        *pion.PeerConnection
 	connected core.Waiter
 	closed    bool
+	lanRetry  *lanRetryState
 
 	// HEVC only:
 	dc         *pion.DataChannel
@@ -96,14 +97,15 @@ func Dial(rawURL string) (core.Producer, error) {
 	}
 
 	if useLanApi {
-		if !lanRetry.Allow() {
-			return nil, fmt.Errorf("tuya lan: camera session busy, retry in %s", lanRetry.Remaining())
-		}
-
-		if client.api, err = NewTuyaLanApiClient(u); err != nil {
-			lanRetry.Failed()
+		lanClient, err := NewTuyaLanApiClient(u)
+		if err != nil {
 			return nil, fmt.Errorf("tuya: %w", err)
 		}
+		client.lanRetry = lanRetries.For(lanClient.deviceId)
+		if !client.lanRetry.Allow() {
+			return nil, fmt.Errorf("tuya lan: camera session busy, retry in %s", client.lanRetry.Remaining())
+		}
+		client.api = lanClient
 	} else if useSmartApi {
 		if client.api, err = NewTuyaSmartApiClient(nil, u.Hostname(), email, password, deviceId); err != nil {
 			return nil, fmt.Errorf("tuya: %w", err)
@@ -116,7 +118,7 @@ func Dial(rawURL string) (core.Producer, error) {
 
 	if err := client.api.Init(); err != nil {
 		if useLanApi {
-			lanRetry.Failed()
+			client.lanRetry.Failed()
 		}
 		return nil, fmt.Errorf("tuya: %w", err)
 	}
@@ -153,7 +155,11 @@ func Dial(rawURL string) (core.Producer, error) {
 	client.conn = webrtc.NewConn(client.pc)
 	client.conn.FormatName = "tuya/webrtc"
 	client.conn.Mode = core.ModeActiveProducer
-	client.conn.Protocol = "mqtt"
+	if useLanApi {
+		client.conn.Protocol = "tuya-lan"
+	} else {
+		client.conn.Protocol = "mqtt"
+	}
 
 	signalClient := client.api.GetSignal()
 	if signalClient == nil {
@@ -342,19 +348,19 @@ func Dial(rawURL string) (core.Producer, error) {
 
 	sendOffer.Done(nil)
 
-	// Bound the whole session setup. When the camera has no media session left to hand out it
-	// answers the offer and then simply never starts sending media, and this wait has no
-	// deadline of its own: the producer would stay blocked forever, so the source never
-	// retried and stayed dead until go2rtc was restarted.
-	sessionTimer := time.AfterFunc(sessionTimeout, func() {
-		client.connected.Done(errors.New("tuya: session timeout"))
-	})
-	defer sessionTimer.Stop()
+	if useLanApi {
+		// Bound only LAN setup. Existing Smart/Cloud sources intentionally keep their
+		// previous behavior; this timeout comes from the LAN camera's admission limit.
+		sessionTimer := time.AfterFunc(sessionTimeout, func() {
+			client.connected.Done(errors.New("session timeout"))
+		})
+		defer sessionTimer.Stop()
+	}
 
 	// Wait for connection
 	if err = client.connected.Wait(); err != nil {
 		if useLanApi {
-			lanRetry.Failed()
+			client.lanRetry.Failed()
 		}
 		err = fmt.Errorf("tuya: %w", err)
 		client.Close(err)
@@ -366,14 +372,12 @@ func Dial(rawURL string) (core.Producer, error) {
 	// streams module retries with its backoff (1s/5s/10s/60s) instead of re-opening a session
 	// immediately - a hot retry loop keeps the camera's (very small) session table full, which
 	// is what makes the source stay broken until the process is restarted.
-	if !client.isHEVC {
+	if useLanApi && !client.isHEVC {
 		deadline := time.Now().Add(noMediaTimeout)
-		for len(client.conn.Receivers) == 0 {
+		for !hasInboundRTP(client.pc) {
 			if time.Now().After(deadline) {
 				err = errors.New("tuya: no media from camera")
-				if useLanApi {
-					lanRetry.Failed()
-				}
+				client.lanRetry.Failed()
 				client.Close(err)
 				return nil, err
 			}
@@ -382,10 +386,19 @@ func Dial(rawURL string) (core.Producer, error) {
 	}
 
 	if useLanApi {
-		lanRetry.OK()
+		client.lanRetry.OK()
 	}
 
 	return client, nil
+}
+
+func hasInboundRTP(pc *pion.PeerConnection) bool {
+	for _, report := range pc.GetStats() {
+		if inbound, ok := report.(pion.InboundRTPStreamStats); ok && inbound.PacketsReceived > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Client) GetMedias() []*core.Media {
@@ -402,21 +415,14 @@ func (c *Client) AddTrack(media *core.Media, codec *core.Codec, track *core.Rece
 		return errors.New("webrtc: can't get track")
 	}
 
-	// DISABLED: Speaker Protocol 312 command
-	// JavaScript client doesn't send this on first call either
-	// Only subsequent calls (when speakerChloron is set) send Protocol 312
-	// mqttClient := c.api.GetMqtt()
-	// if mqttClient != nil {
-	// 	_ = mqttClient.SendSpeaker(1)
-	// }
-
-	// Protocol 312 (speaker): opens the camera's speaker for the backchannel. The
-	// command is acknowledged asynchronously by the camera, so it must not be sent
-	// inline from AddTrack. Only the LAN transport is known to answer it, the cloud
-	// path keeps it disabled.
+	// Protocol 312 opens the camera speaker. SendSignal only writes the command; it
+	// does not wait for an acknowledgement, so doing it inline preserves write
+	// failures instead of losing them in a detached goroutine.
 	if _, isLAN := c.api.(*TuyaLanAPIClient); isLAN {
 		if signalClient := c.api.GetSignal(); signalClient != nil {
-			go func() { _ = signalClient.SendSpeaker(1) }()
+			if err := signalClient.SendSpeaker(1); err != nil {
+				return fmt.Errorf("tuya lan: speaker: %w", err)
+			}
 		}
 	}
 

@@ -275,24 +275,41 @@ func TestLanRetryDelay(t *testing.T) {
 func TestLanRetryAllow(t *testing.T) {
 	// Contract: a failed attempt closes the window (no camera traffic until it expires), a
 	// successful session clears the state, and both are observable through Allow/Remaining.
-	lanRetry.OK()
-	if !lanRetry.Allow() {
+	retry := new(lanRetryState)
+	if !retry.Allow() {
 		t.Fatal("fresh state must allow a session")
 	}
-	if d := lanRetry.Remaining(); d != 0 {
+	if d := retry.Remaining(); d != 0 {
 		t.Fatalf("fresh state remaining = %s, want 0", d)
 	}
 
-	lanRetry.Failed()
-	if lanRetry.Allow() {
+	retry.Failed()
+	if retry.Allow() {
 		t.Fatal("must not allow a session right after a failure")
 	}
-	if d := lanRetry.Remaining(); d <= 0 || d > lanRetryMax {
+	if d := retry.Remaining(); d <= 0 || d > lanRetryMax {
 		t.Fatalf("remaining = %s, want (0, %s]", d, lanRetryMax)
 	}
 
-	lanRetry.OK()
-	if !lanRetry.Allow() {
+	retry.OK()
+	if !retry.Allow() {
 		t.Fatal("a successful session must clear the backoff")
+	}
+}
+
+func TestLanRetryIsPerCamera(t *testing.T) {
+	var retries lanRetryRegistry
+	first := retries.For("camera-1")
+	second := retries.For("camera-2")
+
+	first.Failed()
+	if first.Allow() {
+		t.Fatal("failed camera must enter backoff")
+	}
+	if !second.Allow() {
+		t.Fatal("failure of camera-1 must not suppress camera-2")
+	}
+	if got := retries.For("camera-1"); got != first {
+		t.Fatal("same camera must retain its retry history across dials")
 	}
 }

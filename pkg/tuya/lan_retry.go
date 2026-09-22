@@ -26,7 +26,30 @@ type lanRetryState struct {
 	until    time.Time
 }
 
-var lanRetry lanRetryState
+// Retry state is per physical camera. A package-global window makes one offline
+// camera suppress every other tuya-lan source in the process, even though their
+// session tables are independent.
+type lanRetryRegistry struct {
+	mu       sync.Mutex
+	byDevice map[string]*lanRetryState
+}
+
+func (r *lanRetryRegistry) For(deviceID string) *lanRetryState {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.byDevice == nil {
+		r.byDevice = make(map[string]*lanRetryState)
+	}
+	state := r.byDevice[deviceID]
+	if state == nil {
+		state = new(lanRetryState)
+		r.byDevice[deviceID] = state
+	}
+	return state
+}
+
+var lanRetries lanRetryRegistry
 
 // Allow reports whether a new session may be opened now. While the window is active the dial is
 // rejected without touching the camera: every attempt, successful or not, occupies one of the

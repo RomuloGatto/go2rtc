@@ -27,11 +27,11 @@ streams:
   camera:
     # video + camera microphone
     - rtsp://user:pass@192.168.1.10:554/live/ch0
-    # microphone (camera speaker) over the Tuya LAN protocol
+    # talkback: client microphone -> camera speaker over the Tuya LAN protocol
     - tuya-lan://192.168.1.10?device_id=XXX&local_key=XXXXXXXXXXXXXXXX
 ```
 
-Parameters (all optional except `device_id` and `local_key`):
+The URL host is the camera address. Parameters (all optional except `device_id` and `local_key`):
 - `local_key` - 16 byte device local key (Tuya IoT Platform > device > `Get Device Information`,
   or `tuya-cli wizard`).
 - `port` - signaling port, default `6668`.
@@ -68,6 +68,9 @@ Notes:
   standard RTSP/ONVIF source first for video and use the LAN source for two-way audio.
 - Most cameras accept a single audio session at a time: while go2rtc holds the LAN session, the
   camera may stop sending audio over RTSP, and a second client may get no audio at all.
+- A camera that accepts signaling but sends no media is retried with a per-device exponential
+  backoff (up to two minutes), allowing its small session table to drain without delaying other
+  Tuya LAN cameras. These timeouts do not change the existing Smart or Cloud API transports.
 
 ### Tuya Smart API / Cloud API
 
